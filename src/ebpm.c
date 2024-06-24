@@ -1,114 +1,83 @@
-/**
- * @file ebpm.c
- * @author Egor Belyaev (eleectricgore@gmail.com)
- * @brief 
- * @version 0.1
- * @date 2024-05-23
- *
- * SPDX-License-Identifier: (Apache License, Version 2.0)
- * @copyright Copyright (c) 2024
- * 
- */
+#include <assert.h>
 #include <argp.h>
-#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
 #include <time.h>
-#include <asm/unistd.h>
+#include <limits.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/resource.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
 #include <linux/perf_event.h>
-#include "ebpm.h"
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+
 #include "ebpm.skel.h"
-#include "trace_helpers.h"
+#include "ebpm.h"
+#include "blazesym.h"
 
-#define OPT_PERF_MAX_STACK_DEPTH	1 /* --perf-max-stack-depth */
-#define OPT_STACK_STORAGE_SIZE		2 /* --stack-storage-size */
+#include "function_hash_table.h"
 
-/*
- * -EFAULT in get_stackid normally means the stack-trace is not available,
- * such as getting kernel stack trace in user mode
- */
-#define STACK_ID_EFAULT(stack_id)	(stack_id == -EFAULT)
+#define OPT_SYSTEM_PROFILING_MODE   1 /* --profile */
 
-#define STACK_ID_ERR(stack_id)		((stack_id < 0) && !STACK_ID_EFAULT(stack_id))
-
-/* hash collision (-EEXIST) suggests that stack map size may be too small */
-#define CHECK_STACK_COLLISION(ustack_id, kstack_id)	\
-	(kstack_id == -EEXIST || ustack_id == -EEXIST)
-
-#define MISSING_STACKS(ustack_id, kstack_id)	\
-	(!env.user_stacks_only && STACK_ID_ERR(kstack_id)) + (!env.kernel_stacks_only && STACK_ID_ERR(ustack_id))
-
-/* This structure combines key_t and count which should be sorted together */
-struct key_ext_t {
-	struct key_t k;
-	__u64 v;
+static struct functions_arr {
+	uint64_t address;
+	uint32_t cpu_id;
+	uint32_t count;
+    char func_name[64];
 };
 
-typedef const char* (*symname_fn_t)(unsigned long);
-
 static struct env {
-	bool system_wide;
+	bool profiling;
 	pid_t pid;
-	pid_t tid;
 	bool user_stacks_only;
 	bool kernel_stacks_only;
-	int stack_storage_size;
-	int perf_max_stack_depth;
+	int duration;
 	bool verbose;
 	bool freq;
 	int sample_freq;
-	bool include_idle;
-	int cpu;
 } env = {
-	.system_wide = false,
+	.profiling = false,
+	.verbose = false,
 	.pid = -1,
-	.tid = -1,
-	.stack_storage_size = 1024,
-	.perf_max_stack_depth = 127,
+	.duration = INT_MAX,
 	.freq = 1,
 	.sample_freq = 49,
-	.cpu = -1,
 };
 
-const char *argp_program_version = "ebpm 0.1";
+const char *argp_program_version = "ebpm 0.0.1";
 const char *argp_program_bug_address =
 	"https://github.com/fug0/ebpm";
 const char argp_program_doc[] =
-"Write program doc.\n"
+"Observability and Application Performance Montioring tool.\n"
 "\n"
-"USAGE: ebpm [OPTIONS...] [duration]\n"
-"EXAMPLES:\n";
+// "USAGE: ebpm [OPTIONS...]\n"
+"EXAMPLES:\n"
+"    ebpm                       # display information about all process currently being managed by the Linux kernel\n"
+"    ebpm -v                    # display information about all process but with verbose debug output\n"
+"    ebpm --profile 1234        # profile process with PID 1234 stack traces at 49 Hertz until Ctrl-C\n"
+"    ebpm --profile 1234 -F 99  # profile stack traces at 99 Hertz until Ctrl-C\n"
+"    ebpm --profile 1234 -d 5   # profile at 49 Hertz for 5 seconds only\n"
+"    ebpm --profile 1234 -U     # only show user space stacks (no kernel)\n"
+"    ebpm --profile 1234 -K     # only show kernel space stacks (no user)\n"
+"\nOPTIONS:";
 
 static const struct argp_option opts[] = {
-	{ "system-wide", 's', NULL, 0, "show system-wide performance analysis (for every running process)" },
-	{ "pid", 'p', "PID", 0, "profile process with this PID only" },
-	{ "tid", 'L', "TID", 0, "profile thread with this TID only" },
-	{ "user-stacks-only", 'U', NULL, 0,
-	  "show stacks from user space only (no kernel space stacks)" },
-	{ "kernel-stacks-only", 'K', NULL, 0,
-	  "show stacks from kernel space only (no user space stacks)" },
-	{ "frequency", 'F', "FREQUENCY", 0, "sample frequency, Hertz" },
-	{ "include-idle ", 'I', NULL, 0, "include CPU idle stacks" },
-	{ "stack-storage-size", OPT_STACK_STORAGE_SIZE, "STACK-STORAGE-SIZE", 0,
-	  "the number of unique stack traces that can be stored and displayed (default 1024)" },
-	{ "perf-max-stack-depth", OPT_PERF_MAX_STACK_DEPTH,
-	  "PERF-MAX-STACK-DEPTH", 0, "the limit for both kernel and user stack traces (default 127)" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "profile", OPT_SYSTEM_PROFILING_MODE, "PID", 0, "launch utility in profiling mode for profiling process with given PID", 0 },
+	{ "user-stacks-only", 'U', NULL, 0, "show stacks from user space only", 0 },
+	{ "kernel-stacks-only", 'K', NULL, 0, "show stacks from kernel space only ", 0 },
+	{ "frequency", 'F', "FREQUENCY", 0, "sample frequency, Hertz", 0 },
+	{ "duration", 'd', "DURATION", 0, "profiling duration (in seconds)", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
-struct ksyms *ksyms;
-struct syms_cache *syms_cache;
-struct syms *syms;
-
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
-	static int pos_args;
-
 	switch (key) {
 	case 'h':
 		argp_state_help(state, stderr, ARGP_HELP_STD_HELP);
@@ -116,22 +85,11 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'v':
 		env.verbose = true;
 		break;
-	case 's':
-		env.system_wide = true;
-		break;
-	case 'p':
+	case 'd':
 		errno = 0;
-		env.pid = strtol(arg, NULL, 10);
-		if (errno) {
-			fprintf(stderr, "invalid PID: %s\n", arg);
-			argp_usage(state);
-		}
-		break;
-	case 'L':
-		errno = 0;
-		env.tid = strtol(arg, NULL, 10);
-		if (errno || env.tid <= 0) {
-			fprintf(stderr, "Invalid TID: %s\n", arg);
+		env.duration = strtol(arg, NULL, 10);
+		if (errno || env.duration <= 0) {
+			fprintf(stderr, "Invalid duration (in s): %s\n", arg);
 			argp_usage(state);
 		}
 		break;
@@ -149,244 +107,24 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			argp_usage(state);
 		}
 		break;
-	case 'I':
-		env.include_idle = true;
-		break;
-	case OPT_PERF_MAX_STACK_DEPTH:
+	case OPT_SYSTEM_PROFILING_MODE:
+		env.profiling = true;
 		errno = 0;
-		env.perf_max_stack_depth = strtol(arg, NULL, 10);
+		env.pid = strtol(arg, NULL, 10);
 		if (errno) {
-			fprintf(stderr, "invalid perf max stack depth: %s\n", arg);
-			argp_usage(state);
-		}
-		break;
-	case OPT_STACK_STORAGE_SIZE:
-		errno = 0;
-		env.stack_storage_size = strtol(arg, NULL, 10);
-		if (errno) {
-			fprintf(stderr, "invalid stack storage size: %s\n", arg);
+			fprintf(stderr, "invalid PID: %s\n", arg);
 			argp_usage(state);
 		}
 		break;
 	case ARGP_KEY_ARG:
-		if (pos_args++) {
-			fprintf(stderr,
-				"Unrecognized positional argument: %s\n", arg);
-			argp_usage(state);
-		}
-		errno = 0;
+		fprintf(stderr,
+			"Unrecognized positional argument: %s\n", arg);
+		argp_usage(state);
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
 	return 0;
-}
-
-static int nr_cpus;
-
-static int open_and_attach_perf_event(int freq, struct bpf_program *prog,
-				      struct bpf_link *links[])
-{
-	struct perf_event_attr attr = {
-		.type = PERF_TYPE_SOFTWARE,
-		.freq = env.freq,
-		.sample_freq = env.sample_freq,
-		.config = PERF_COUNT_SW_CPU_CLOCK,
-	};
-	int i, fd;
-
-	for (i = 0; i < nr_cpus; i++) {
-		if (env.cpu != -1 && env.cpu != i)
-			continue;
-
-		fd = syscall(__NR_perf_event_open, &attr, -1, i, -1, 0);
-		if (fd < 0) {
-			/* Ignore CPU that is offline */
-			if (errno == ENODEV)
-				continue;
-
-			fprintf(stderr, "failed to init perf sampling: %s\n",
-				strerror(errno));
-			return -1;
-		}
-
-		links[i] = bpf_program__attach_perf_event(prog, fd);
-		if (!links[i]) {
-			fprintf(stderr, "failed to attach perf event on cpu: "
-				"%d\n", i);
-			links[i] = NULL;
-			close(fd);
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-
-static int cmp_counts(const void *a, const void *b)
-{
-	const __u64 x = ((struct key_ext_t *) a)->v;
-	const __u64 y = ((struct key_ext_t *) b)->v;
-
-	/* descending order */
-	return y - x;
-}
-
-static int read_counts_map(int fd, struct key_ext_t *items, __u32 *count)
-{
-	struct key_t empty = {};
-	struct key_t *lookup_key = &empty;
-	int i = 0;
-	int err;
-
-	while (bpf_map_get_next_key(fd, lookup_key, &items[i].k) == 0) {
-		err = bpf_map_lookup_elem(fd, &items[i].k, &items[i].v);
-		if (err < 0) {
-			fprintf(stderr, "failed to lookup counts: %d\n", err);
-			return -err;
-		}
-
-		if (items[i].v == 0)
-			continue;
-
-		lookup_key = &items[i].k;
-		i++;
-	}
-
-	*count = i;
-	return 0;
-}
-
-static const char *ksymname(unsigned long addr)
-{
-	const struct ksym *ksym = ksyms__map_addr(ksyms, addr);
-
-	return ksym ? ksym->name : "[unknown]";
-}
-
-static const char *usymname(unsigned long addr)
-{
-	const struct sym *sym = syms__map_addr(syms, addr);
-
-	return sym ? sym->name : "[unknown]";
-}
-
-static void print_stacktrace(unsigned long *ip, symname_fn_t symname)
-{
-	for (size_t i = 0; ip[i] && i < env.perf_max_stack_depth; i++)
-		printf("    %s\n", symname(ip[i]));
-}
-
-static int print_count(struct key_t *event, __u64 count, int stack_map)
-{
-	unsigned long *ip;
-
-	ip = calloc(env.perf_max_stack_depth, sizeof(unsigned long));
-	if (!ip) {
-		fprintf(stderr, "failed to alloc ip\n");
-		return -ENOMEM;
-	}
-
-	/* kernel stack */
-	if (!env.user_stacks_only && !STACK_ID_EFAULT(event->kern_stack_id)) {
-		if (bpf_map_lookup_elem(stack_map, &event->kern_stack_id, ip) != 0)
-			printf("    [Missed Kernel Stack]\n");
-		else
-			print_stacktrace(ip, ksymname);
-	}
-
-	/* user stack */
-	if (!env.kernel_stacks_only && !STACK_ID_EFAULT(event->user_stack_id)) {
-		if (bpf_map_lookup_elem(stack_map, &event->user_stack_id, ip) != 0) {
-			printf("    [Missed User Stack]\n");
-		} else {
-			syms = syms_cache__get_syms(syms_cache, event->pid);
-			if (!syms)
-				fprintf(stderr, "failed to get syms\n");
-			else
-				print_stacktrace(ip, usymname);
-		}
-	}
-
-	/* process information */
-	printf("    %-16s %s (%d)\n", "-", event->name, event->pid);
-
-	/* count sampled */
-	printf("        %lld\n\n", count);
-
-	free(ip);
-
-	return 0;
-}
-
-static int print_counts(int counts_map, int stack_map)
-{
-	struct key_ext_t *counts;
-	struct key_t *event;
-	__u64 count;
-	__u32 nr_count = MAX_ENTRIES;
-	size_t nr_missing_stacks = 0;
-	bool has_collision = false;
-	int i, ret = 0;
-
-	counts = calloc(MAX_ENTRIES, sizeof(struct key_ext_t));
-	if (!counts) {
-		fprintf(stderr, "Out of memory\n");
-		return -ENOMEM;
-	}
-
-	ret = read_counts_map(counts_map, counts, &nr_count);
-	if (ret)
-		goto cleanup;
-
-	qsort(counts, nr_count, sizeof(struct key_ext_t), cmp_counts);
-
-	for (i = 0; i < nr_count; i++) {
-		event = &counts[i].k;
-		count = counts[i].v;
-
-		print_count(event, count, stack_map);
-
-		/* handle stack id errors */
-		nr_missing_stacks += MISSING_STACKS(event->user_stack_id, event->kern_stack_id);
-		has_collision = CHECK_STACK_COLLISION(event->user_stack_id, event->kern_stack_id);
-	}
-
-	if (nr_missing_stacks > 0) {
-		fprintf(stderr, "WARNING: %zu stack traces could not be displayed.%s\n",
-			nr_missing_stacks, has_collision ?
-			" Consider increasing --stack-storage-size.":"");
-	}
-
-cleanup:
-	free(counts);
-
-	return ret;
-}
-
-static void print_headers()
-{
-	printf("Sampling at %d Hertz of", env.sample_freq);
-
-	if (env.pid != -1)
-		printf(" PID %d", env.pid);
-	else if (env.tid != -1)
-		printf(" TID %d", env.tid);
-	else
-		printf(" all threads");
-
-	if (env.user_stacks_only)
-		printf(" by user");
-	else if (env.kernel_stacks_only)
-		printf(" by kernel");
-	else
-		printf(" by user + kernel");
-
-	if (env.cpu != -1)
-		printf(" on CPU#%d", env.cpu);
-
-	printf("... Hit Ctrl-C to end.\n");
 }
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -404,45 +142,151 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
+/*
+ * This function is from libbpf, but it is not a public API and can only be
+ * used for demonstration. We can use this here because we statically link
+ * against the libbpf built from submodule during build.
+ */
+extern int parse_cpu_mask_file(const char *fcpu, bool **mask, int *mask_sz);
+
+static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd,
+			    unsigned long flags)
+{
+	int ret;
+
+	ret = syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
+	return ret;
+}
+
+static struct blaze_symbolizer *symbolizer;
+
+static FunctionHashTable *func_table;
+
+static void print_frame(const char *name, uintptr_t input_addr, uintptr_t addr, uint64_t offset, const blaze_symbolize_code_info* code_info)
+{
+    // If we have an input address  we have a new symbol.
+    if (input_addr != 0) {
+      printf("%016lx: %s @ 0x%lx+0x%lx", input_addr, name, addr, offset);
+			if (code_info != NULL && code_info->dir != NULL && code_info->file != NULL) {
+				printf(" %s/%s:%u\n", code_info->dir, code_info->file, code_info->line);
+      } else if (code_info != NULL && code_info->file != NULL) {
+				printf(" %s:%u\n", code_info->file, code_info->line);
+      } else {
+				printf("\n");
+      }
+    } else {
+      printf("%16s  %s", "", name);
+			if (code_info != NULL && code_info->dir != NULL && code_info->file != NULL) {
+				printf("@ %s/%s:%u [inlined]\n", code_info->dir, code_info->file, code_info->line);
+      } else if (code_info != NULL && code_info->file != NULL) {
+				printf("@ %s:%u [inlined]\n", code_info->file, code_info->line);
+      } else {
+				printf("[inlined]\n");
+      }
+    }
+}
+
+static void handle_stack_trace(__u64 *stack, int stack_sz, pid_t pid, const char *comm, __u32 cpu_id)
+{
+  	const struct blaze_symbolize_inlined_fn* inlined;
+	const struct blaze_result *result;
+	const struct blaze_sym *sym;
+	int i, j;
+
+	assert(sizeof(uintptr_t) == sizeof(uint64_t));
+
+	if (pid) {
+		struct blaze_symbolize_src_process src = {
+			.type_size = sizeof(src),
+			.pid = pid,
+		};
+		result = blaze_symbolize_process_abs_addrs(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
+	} else {
+		struct blaze_symbolize_src_kernel src = {
+			.type_size = sizeof(src),
+		};
+		result = blaze_symbolize_kernel_abs_addrs(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
+	}
+
+	for (i = 0; i < stack_sz; i++) {
+		if (!result || result->cnt <= i || result->syms[i].name == NULL) {
+			function_hash_table_put(func_table, stack[i], "[undefined]", pid, cpu_id, comm);
+		}
+
+		sym = &result->syms[i];
+
+		function_hash_table_put(func_table, stack[i], sym->name, pid, cpu_id, comm);
+
+		//print_frame(sym->name, stack[i], sym->addr, sym->offset, &sym->code_info);
+		for (j = 0; j < sym->inlined_cnt; j++) {
+			inlined = &sym->inlined[j];
+			//print_frame(sym->name, 0, 0, 0, &inlined->code_info);
+		}
+	}
+
+	blaze_result_free(result);
+}
+
+/* Receive events from the ring buffer. */
+static int event_handler(void *_ctx, void *data, size_t size)
+{
+	struct stacktrace_event *event = data;
+
+	if (event->kstack_sz <= 0 && event->ustack_sz <= 0)
+		return 1;
+
+	// printf("COMM: %s (pid=%d) @ CPU %d\n", event->comm, event->pid, event->cpu_id);
+
+	if (event->kstack_sz > 0) {
+		handle_stack_trace(event->kstack, event->kstack_sz / sizeof(__u64), 0, event->comm, event->cpu_id);
+	}
+
+	if (event->ustack_sz > 0) {
+		handle_stack_trace(event->ustack, event->ustack_sz / sizeof(__u64), event->pid, event->comm, event->cpu_id);
+	}
+
+	return 0;
+}
+
 static const char *get_task_state(__u32 state)
 {
-	/* Taken from:
-	 * https://elixir.bootlin.com/linux/latest/source/include/linux/sched.h#L85
-	 * There are a lot more states not covered here but these are common ones.
-	 */
 	switch (state) {
-	case 0x0000:
-		return "RUNNING";
-	case 0x0001:
-		return "INTERRUPTIBLE";
-	case 0x0002:
-		return "UNINTERRUPTIBLE";
-	case 0x0200:
-		return "WAKING";
-	case 0x0400:
-		return "NOLOAD";
-	case 0x0402:
-		return "IDLE";
-	case 0x0800:
-		return "NEW";
-	default:
-		return "<unknown>";
+		case 0x0000: return "RUNNING";
+		case 0x0001: return "INTERRUPTIBLE";
+		case 0x0002: return "UNINTERRUPTIBLE";
+		case 0x0200: return "WAKING";
+		case 0x0400: return "NOLOAD";
+		case 0x0402: return "IDLE";
+		case 0x0800: return "NEW";
+		default: return "<unknown>";
 	}
 }
 
-int main(int argc, char **argv)
+int main(int argc, char *const argv[])
 {
 	static const struct argp argp = {
 		.options = opts,
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct bpf_link *links[MAX_CPU_NR] = {};
-	struct ebpm_bpf *skel;
+
+	ssize_t ret;
+	int i, err = 0;
+
+	const char *online_cpus_file = "/sys/devices/system/cpu/online";
+	int freq = 1, pid = -1, cpu;
+	struct ebpm_bpf *skel = NULL;
+	struct perf_event_attr attr;
+	struct bpf_link **links = NULL;
+	struct ring_buffer *ring_buf = NULL;
+	int num_cpus, num_online_cpus;
+	int *pefds = NULL, pefd;
+	bool *online_mask = NULL;
+
 	struct task_info buf;
 	int iter_fd;
-	ssize_t ret;
-	int err, i;
+
+	func_table = create_function_hash_table();
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
@@ -453,32 +297,39 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Set up libbpf errors and debug info callback */
+	//enable_raw_mode();
 	libbpf_set_print(libbpf_print_fn);
 
 	/* Cleaner handling of Ctrl-C */
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
 
-	/* Open, load, and verify BPF application */
-	skel = ebpm_bpf__open();
-	if (!skel) {
-		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+	err = parse_cpu_mask_file(online_cpus_file, &online_mask, &num_online_cpus);
+	if (err) {
+		fprintf(stderr, "Fail to get online CPU numbers: %d\n", err);
 		goto cleanup;
 	}
 
-	if(!env.system_wide) {
-		/* initialize global data (filtering options) */
-		skel->rodata->targ_pid = env.pid;
-		skel->rodata->targ_tid = env.tid;
-		skel->rodata->user_stacks_only = env.user_stacks_only;
-		skel->rodata->kernel_stacks_only = env.kernel_stacks_only;
-		skel->rodata->include_idle = env.include_idle;
+	num_cpus = libbpf_num_possible_cpus();
+	if (num_cpus <= 0) {
+		fprintf(stderr, "Fail to get the number of processors\n");
+		err = -1;
+		goto cleanup;
 	}
 
-	bpf_map__set_value_size(skel->maps.stackmap,
-			env.perf_max_stack_depth * sizeof(unsigned long));
-	bpf_map__set_max_entries(skel->maps.stackmap, env.stack_storage_size);
+	skel = ebpm_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "failed to open BPF object\n");
+		return 1;
+	}
+
+	if(env.profiling) {
+		/* initialize global data (filtering options) */
+		skel->rodata->targ_pid = env.pid;
+		skel->rodata->user_stacks_only = env.user_stacks_only;
+		skel->rodata->kernel_stacks_only = env.kernel_stacks_only;
+		skel->rodata->num_cpus = num_cpus;
+	}
 
 	err = ebpm_bpf__load(skel);
 	if (err) {
@@ -486,34 +337,91 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	if(!env.system_wide) {
-		ksyms = ksyms__load();
-		if (!ksyms) {
-			fprintf(stderr, "failed to load kallsyms\n");
+	if(env.profiling) {
+		symbolizer = blaze_symbolizer_new();
+		if (!symbolizer) {
+			fprintf(stderr, "Fail to create a symbolizer\n");
+			err = -1;
 			goto cleanup;
 		}
 
-		syms_cache = syms_cache__new(0);
-		if (!syms_cache) {
-			fprintf(stderr, "failed to create syms_cache\n");
+		/* Prepare ring buffer to receive events from the BPF program. */
+		ring_buf = ring_buffer__new(bpf_map__fd(skel->maps.events), event_handler, NULL, NULL);
+		if (!ring_buf) {
+			err = -1;
 			goto cleanup;
 		}
 
-		err = open_and_attach_perf_event(env.freq, skel->progs.do_perf_event, links);
-		if (err)
-			goto cleanup;
+		pefds = malloc(num_cpus * sizeof(int));
+		for (i = 0; i < num_cpus; i++) {
+			pefds[i] = -1;
+		}
 
-		print_headers();
+		links = calloc(num_cpus, sizeof(struct bpf_link *));
 
-		sleep(5);
+		memset(&attr, 0, sizeof(attr));
+		attr.type = PERF_TYPE_HARDWARE;
+		attr.size = sizeof(attr);
+		attr.config = PERF_COUNT_HW_CPU_CYCLES;
+		attr.sample_freq = freq;
+		attr.freq = 1;
 
-		print_counts(bpf_map__fd(skel->maps.counts),
-		     		 bpf_map__fd(skel->maps.stackmap));
+		for (cpu = 0; cpu < num_cpus; cpu++) {
+			/* skip offline/not present CPUs */
+			if (cpu >= num_online_cpus || !online_mask[cpu])
+				continue;
+
+			/* Set up performance monitoring on a CPU/Core */
+			pefd = perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+			if (pefd < 0) {
+				fprintf(stderr, "Fail to set up performance monitor on a CPU/Core\n");
+				err = -1;
+				goto cleanup;
+			}
+			pefds[cpu] = pefd;
+
+			/* Attach a BPF program on a CPU */
+			links[cpu] = bpf_program__attach_perf_event(skel->progs.profile, pefd);
+			if (!links[cpu]) {
+				err = -1;
+				goto cleanup;
+			}
+		}
+
+		if(env.duration < INT_MAX) {
+			// Record start time
+    		time_t start_time = time(NULL);
+			time_t now;
+
+			// Poll ring buffer for the specified duration
+			while (!exiting) {
+				err = ring_buffer__poll(ring_buf, -1);
+				if (err < 0) {
+					fprintf(stderr, "Error polling ring buffer: %d\n", err);
+					break;
+				}
+
+				now = time(NULL);
+				if (difftime(now, start_time) >= env.duration) {
+					break;
+				}
+			}
+		} else {
+			while(!exiting) {
+				err = ring_buffer__poll(ring_buf, -1);
+				if (err < 0) {
+					//fprintf(stderr, "End of ring buffer polling.\n");
+					break;
+				}
+			}
+		}
+
+		print_hash_table(func_table);
 	} else {
 		/* Attach tracepoints */
 		err = ebpm_bpf__attach(skel);
 		if (err) {
-			fprintf(stderr, "Failed to attach BPF skeleton\n");
+			fprintf(stderr, "Failed to attach BPF object\n");
 			goto cleanup;
 		}
 
@@ -524,7 +432,9 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		while (true) {
+		printf("|%-7s|%-7s|%-16s|%-16s|%-16s|%-16s|%-16s\n-------------------------------------------------------------------------------------------\n", 
+		"PID", "TID", "NAME", "STATE", "CPU TIME", "VIRT MEM", "RSS MEM");
+		while (!exiting) {
 			ret = read(iter_fd, &buf, sizeof(struct task_info));
 			if (ret < 0) {
 				if (errno == EAGAIN)
@@ -534,31 +444,32 @@ int main(int argc, char **argv)
 			}
 			if (ret == 0)
 				break;
-			if (buf.kstack_len <= 0) {
-				printf("Error getting kernel stack for task. Task Info. Pid: %d. Process Name: %s. Kernel Stack Error: %d. State: %s\n",
-					buf.pid, buf.comm, buf.kstack_len, get_task_state(buf.state));
-			} else {
-				printf("Task Info. Pid: %d. Process Name: %s. Kernel Stack Len: %d. State: %s\n",
-					buf.pid, buf.comm, buf.kstack_len, get_task_state(buf.state));
-			}
+			printf("%-7u %-7u %-16s %-16s %-16llu %-16llu %-16llu\n", buf.pid, buf.tid, buf.comm, get_task_state(buf.state), buf.cpu_time, buf.vsize, buf.rss);
 		}
 	}
 
 cleanup:
-	/* Clean up */
-	if (env.cpu != -1)
-		bpf_link__destroy(links[env.cpu]);
-	else {
-		for (i = 0; i < nr_cpus; i++)
-			bpf_link__destroy(links[i]);
+	if (links) {
+		for (cpu = 0; cpu < num_cpus; cpu++)
+			bpf_link__destroy(links[cpu]);
+		free(links);
 	}
-	if (syms_cache)
-		syms_cache__free(syms_cache);
-	if (ksyms)
-		ksyms__free(ksyms);
-
-	close(iter_fd);
+	if (pefds) {
+		for (i = 0; i < num_cpus; i++) {
+			if (pefds[i] >= 0)
+				close(pefds[i]);
+		}
+		free(pefds);
+	}
+	if(env.profiling) {
+		ring_buffer__free(ring_buf);
+		free_function_hash_table(func_table);
+		blaze_symbolizer_free(symbolizer);
+	} else {
+		close(iter_fd);
+	}
 	ebpm_bpf__destroy(skel);
+	free(online_mask);
 
 	return err < 0 ? -err : 0;
 }

@@ -9,6 +9,8 @@ BPFTOOL ?= $(BPFTOOL_OUTPUT)/bootstrap/bpftool
 LIBBLAZESYM_SRC := $(abspath ../blazesym/)
 LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(OUTPUT)/libblazesym_c.a)
+# CROSS_BUILD_DEPS := $(abspath ./deps)
+EXTERNAL_DEP := function_hash_table
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
 			 | sed 's/arm.*/arm/' \
 			 | sed 's/aarch64/arm64/' \
@@ -16,6 +18,7 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
 			 | sed 's/mips.*/mips/' \
 			 | sed 's/riscv64/riscv/' \
 			 | sed 's/loongarch64/loongarch/')
+#ARCH := arm64
 VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
 # Use our own libbpf API headers and Linux UAPI headers distributed with
 # libbpf to avoid dependency on system-wide headers, which could be missing or
@@ -24,22 +27,24 @@ INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi -I$(dir $(VMLINUX)) -I$(LIBBLAZ
 CFLAGS := -g -Wall
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
-APPS = ebpm
-
-COMMON_OBJ = \
-	$(OUTPUT)/trace_helpers.o \
-	$(OUTPUT)/uprobe_helpers.o \
-	#
-
-# CARGO ?= $(shell which cargo)
-# ifeq ($(strip $(CARGO)),)
-# BZS_APPS :=
-# else
-# BZS_APPS := profile
-# APPS += $(BZS_APPS)
-# # Required by libblazesym
-# ALL_LDFLAGS += -lrt -ldl -lpthread -lm
+# ifneq ($(CROSS_COMPILE),)
+# CFLAGS += --target=$(CROSS_COMPILE) -march=armv8-a
+# ALL_LDFLAGS += --target=$(CROSS_COMPILE) -fuse-ld=lld
 # endif
+
+APPS =
+# APPS = minimal minimal_legacy minimal_ns bootstrap uprobe kprobe fentry \
+#        usdt sockfilter tc ksyscall task_iter lsm
+
+CARGO ?= $(shell which cargo)
+ifeq ($(strip $(CARGO)),)
+BZS_APPS :=
+else
+BZS_APPS := ebpm
+APPS += $(BZS_APPS)
+# Required by libblazesym
+ALL_LDFLAGS += -lrt -ldl -lpthread -lm
+endif
 
 # Get Clang's default includes on this system. We'll explicitly add these dirs
 # to the includes list when compiling with `-target bpf` because otherwise some
@@ -86,12 +91,23 @@ $(OUTPUT) $(OUTPUT)/libbpf $(BPFTOOL_OUTPUT):
 	$(Q)mkdir -p $@
 
 # Build libbpf
+# ifeq ($(CROSS_COMPILE),)
 $(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPUT)/libbpf
 	$(call msg,LIB,$@)
 	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1		      \
-		    OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
-		    INCLUDEDIR= LIBDIR= UAPIDIR=			      \
-		    install
+			OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
+			INCLUDEDIR= LIBDIR= UAPIDIR=			      \
+			install
+# else
+# $(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPUT)/libbpf
+# 	$(call msg,LIB,$@)
+# 	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1		      \
+# 			CROSS_COMPILE=$(CROSS_COMPILE)						  \
+# 			EXTRA_LDFLAGS=-L$(CROSS_BUILD_DEPS)/$(ARCH)/libelf,$(CROSS_BUILD_DEPS)/$(ARCH)/zlib 	  \
+# 			OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
+# 			INCLUDEDIR= LIBDIR= UAPIDIR=			      \
+# 			install
+# endif
 
 # Build bpftool
 $(BPFTOOL): | $(BPFTOOL_OUTPUT)
@@ -122,6 +138,10 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
 # Build user-space code
 $(patsubst %,$(OUTPUT)/%.o,$(APPS)): %.o: %.skel.h
 
+$(EXTERNAL_DEP): $(EXTERNAL_DEP).c $(EXTERNAL_DEP).h | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
+
 $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
@@ -131,7 +151,7 @@ $(patsubst %,$(OUTPUT)/%.o,$(BZS_APPS)): $(LIBBLAZESYM_OBJ)
 $(BZS_APPS): $(LIBBLAZESYM_OBJ)
 
 # Build application binary
-$(APPS): %: $(OUTPUT)/%.o $(COMMON_OBJ) $(LIBBPF_OBJ) | $(OUTPUT)
+$(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) $(EXTERNAL_DEP) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
 

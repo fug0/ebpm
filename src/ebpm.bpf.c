@@ -1,40 +1,25 @@
-/**
- * @file ebpm.bpf.c
- * @author Egor Belyaev (eleectricgore@gmail.com)
- * @brief 
- * @version 0.1
- * @date 2024-05-23
- * 
- * @copyright Copyright (c) 2024
- * 
- */
-
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Copyright (c) 2022 Meta Platforms, Inc. */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+
 #include "ebpm.h"
-#include "maps.bpf.h"
+
+#define PAGE_SHIFT 12
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+const volatile pid_t targ_pid = -1;
 const volatile bool kernel_stacks_only = false;
 const volatile bool user_stacks_only = false;
-const volatile bool include_idle = false;
-const volatile pid_t targ_pid = -1;
-const volatile pid_t targ_tid = -1;
+const volatile int num_cpus;
 
 struct {
-	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
-	__type(key, u32);
-} stackmap SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, struct key_t);
-	__type(value, u64);
-	__uint(max_entries, MAX_ENTRIES);
-} counts SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} events SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -64,6 +49,26 @@ static __u32 get_task_state(void *arg)
 	}
 }
 
+// Helper function to read percpu_counter
+static __always_inline s64 read_percpu_counter(struct percpu_counter *counter) {
+    s64 count = 0;
+    s64 *counters;
+    int i;
+
+    bpf_core_read(&count, sizeof(count), &counter->count);
+    bpf_core_read(&counters, sizeof(counters), &counter->counters);
+
+    if (counters) {
+        for (i = 0; i < num_cpus; i++) {
+            s32 c;
+            bpf_core_read(&c, sizeof(c), &counters[i]);
+            count += c;
+        }
+    }
+
+    return count;
+}
+
 static __u32 zero = 0;
 
 SEC("iter/task")
@@ -72,64 +77,91 @@ int get_tasks(struct bpf_iter__task *ctx)
 	struct seq_file *seq = ctx->meta->seq;
 	struct task_struct *task = ctx->task;
 	struct task_info *t;
+	struct mm_struct *mm;
+    struct percpu_counter file_rss;
+    struct percpu_counter anon_rss;
 	long res;
 
 	if (!task)
-		return 0;
+		return 1;
 
 	t = bpf_map_lookup_elem(&task_info_buf, &zero);
 	if (!t)
-		return 0;
+		return 1;
+		
+
+    // int pid = task->pid;
+
+	// if(tgid != pid) {
+	// 	return 1;
+	// }
 
 	t->pid = task->tgid;
 	t->tid = task->pid;
+	// t->pid = task->tgid >> 32;
+	// t->tid = task->pid;
 	t->state = get_task_state(task);
+	t->cpu_time = task->se.sum_exec_runtime;
+    t->vsize = task->mm ? task->mm->total_vm << PAGE_SHIFT : 0;	
+
+	mm = BPF_CORE_READ(task, mm);
+    if (mm) {
+        // Read file and anonymous RSS counters
+        BPF_CORE_READ_INTO(&file_rss, mm, rss_stat[MM_FILEPAGES]);
+        BPF_CORE_READ_INTO(&anon_rss, mm, rss_stat[MM_ANONPAGES]);
+
+        // Calculate total RSS in bytes
+        t->rss = (read_percpu_counter(&file_rss) + read_percpu_counter(&anon_rss)) << PAGE_SHIFT;
+	}
+
+    // t->rss = task->mm ? task->mm->rss_stat.count[MM_FILEPAGES].counter + task->mm->rss_stat.count[MM_ANONPAGES].counter : 0;
+	// t->cpu_time = BPF_CORE_READ(task, se.sum_exec_runtime);
+    // t->vsize = BPF_CORE_READ(task, mm, total_vm) << PAGE_SHIFT;
+	// unsigned long file_pages = BPF_CORE_READ(task, mm, rss_stat.count[MM_FILEPAGES].counter);
+	// unsigned long anon_pages = BPF_CORE_READ(task, mm, rss_stat.count[MM_ANONPAGES].counter);
+    // t->rss = (file_pages + anon_pages) << PAGE_SHIFT;
+
 
 	bpf_probe_read_kernel_str(t->comm, TASK_COMM_LEN, task->comm);
-
-	res = bpf_get_task_stack(task, t->kstack, sizeof(__u64) * MAX_STACK_LEN, 0);
-	t->kstack_len = res <= 0 ? res : res / sizeof(t->kstack[0]);
 
 	bpf_seq_write(seq, t, sizeof(struct task_info));
 	return 0;
 }
 
 SEC("perf_event")
-int do_perf_event(struct bpf_perf_event_data *ctx)
+int profile(void *ctx)
 {
-	u64 id = bpf_get_current_pid_tgid();
-	u32 pid = id >> 32;
-	u32 tid = id;
-	u64 *valp;
-	static const u64 zero;
-	struct key_t key = {};
-
-	if (!include_idle && tid == 0)
-		return 0;
+	int pid = bpf_get_current_pid_tgid() >> 32;
+	int cpu_id = bpf_get_smp_processor_id();
+	struct stacktrace_event *event;
+	int cp;
 
 	if (targ_pid != -1 && targ_pid != pid)
 		return 0;
 
-	if (targ_tid != -1 && targ_tid != tid)
-		return 0;
+	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event)
+		return 1;
 
-	key.pid = pid;
-	bpf_get_current_comm(&key.name, sizeof(key.name));
+	event->pid = pid;
+	event->cpu_id = cpu_id;
 
-	if (user_stacks_only)
-		key.kern_stack_id = -1;
+	if (bpf_get_current_comm(event->comm, sizeof(event->comm)))
+		event->comm[0] = 0;
+	
+	if(user_stacks_only) {
+		event->kstack_sz = OFF_STACK_SAMPLING;
+	}
 	else
-		key.kern_stack_id = bpf_get_stackid(&ctx->regs, &stackmap, 0);
+		event->kstack_sz = bpf_get_stack(ctx, event->kstack, sizeof(event->kstack), 0);
 
-	if (kernel_stacks_only)
-		key.user_stack_id = -1;
-	else
-		key.user_stack_id = bpf_get_stackid(&ctx->regs, &stackmap,
-						    BPF_F_USER_STACK);
+	if(kernel_stacks_only) {
+		event->ustack_sz = OFF_STACK_SAMPLING;
+	}
+	else 
+		event->ustack_sz = bpf_get_stack(ctx, event->ustack, sizeof(event->ustack), BPF_F_USER_STACK);
 
-	valp = bpf_map_lookup_or_try_init(&counts, &key, &zero);
-	if (valp)
-		__sync_fetch_and_add(valp, 1);
+	bpf_ringbuf_submit(event, 0);
 
 	return 0;
 }
